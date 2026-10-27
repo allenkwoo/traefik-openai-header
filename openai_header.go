@@ -88,6 +88,9 @@ type Handler struct {
 	batchRegex       *regexp.Regexp
 	maxBodyBytes     int64
 	maxInFlightBytes int64
+	// ownedHeaders are the request headers this plugin sets. Computed once in
+	// New so ServeHTTP does not walk requestFields per request.
+	ownedHeaders []string
 }
 
 // acquire reserves n body bytes against the in-flight budget. It returns false when the budget is full.
@@ -153,10 +156,21 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, fmt.Errorf("%s: maxInFlightBytes must be 0 or greater, got %d", name, config.MaxInFlightBytes)
 	}
 
+	// Every header the plugin may set, so ServeHTTP can clear a client-supplied
+	// copy before anything downstream trusts it.
+	ownedHeaders := make([]string, 0, len(config.RequestFields)+2)
+	for _, header := range config.RequestFields {
+		if headerName := fmt.Sprintf("%v", header); headerName != "" {
+			ownedHeaders = append(ownedHeaders, headerName)
+		}
+	}
+	ownedHeaders = append(ownedHeaders, ParseFailureHeader, UserAgentHeader)
+
 	return &Handler{
 		inFlight:         sharedInFlight(name),
 		name:             name,
 		requestFields:    config.RequestFields,
+		ownedHeaders:     ownedHeaders,
 		chatRegex:        chatRegex,
 		batchRegex:       batchRegex,
 		maxBodyBytes:     config.MaxBodyBytes,
@@ -229,6 +243,13 @@ type batchRequest struct {
 }
 
 func (e *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The plugin owns these headers, so a client must not be able to supply
+	// one itself. Cleared before the early return and before any parse, so no
+	// request path can carry a caller-supplied value downstream.
+	for _, header := range e.ownedHeaders {
+		r.Header.Del(header)
+	}
+
 	isChatCompletionRequest := matches(e.chatRegex, r.RequestURI)
 	isBatchRequest := matches(e.batchRegex, r.RequestURI)
 
@@ -377,7 +398,11 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, message stri
 // bufferedBody serves the buffered request body downstream. Once upstream has read it to EOF,
 // or the request ends, it releases the in-flight budget and drops the buffer so the GC can free it.
 type bufferedBody struct {
-	handler  *Handler
+	handler *Handler
+	// mu guards data, reader and released. The RoundTripper contract lets the
+	// transport Close the body from one goroutine while its write loop Reads
+	// it, so both paths can reach free() concurrently.
+	mu       sync.Mutex
 	data     []byte
 	reader   *bytes.Reader
 	held     int64
@@ -385,10 +410,13 @@ type bufferedBody struct {
 }
 
 func (b *bufferedBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
 	if b.reader == nil {
+		b.mu.Unlock()
 		return 0, io.EOF
 	}
 	n, err := b.reader.Read(p)
+	b.mu.Unlock()
 	if err == io.EOF {
 		b.free()
 	}
@@ -401,13 +429,18 @@ func (b *bufferedBody) Close() error {
 }
 
 func (b *bufferedBody) free() {
+	b.mu.Lock()
 	if b.released {
+		b.mu.Unlock()
 		return
 	}
 	b.released = true
-	b.handler.release(b.held)
+	held := b.held
 	b.reader = nil
 	b.data = nil
+	b.mu.Unlock()
+	// Released outside the lock: the budget is atomic and needs no help from mu.
+	b.handler.release(held)
 }
 
 func (e *Handler) handleChatCompletionRequest(data []byte, r *http.Request) {
