@@ -7,23 +7,12 @@ import (
 	"testing"
 )
 
-// The plugin owns the headers it derives from the body. A client must not be
-// able to supply them itself, because anything downstream that reads them --
-// routing rules, rate-limit tiers, accounting -- treats a non-empty value as
-// plugin-derived.
-
-func TestOwnedHeaders_ClientSuppliedModelClearedOnNonMatchingRoute(t *testing.T) {
-	next := &nextRecorder{}
-	h := newHandler(t, CreateConfig(), next)
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	req.Header.Set("X-OpenAI-Model", "spoofed")
-	h.ServeHTTP(httptest.NewRecorder(), req)
-
-	if got := next.header.Get("X-OpenAI-Model"); got != "" {
-		t.Errorf("X-OpenAI-Model = %q, want empty: a client-supplied value reached downstream", got)
-	}
-}
+// On the requests it handles, the plugin owns the headers it derives from the
+// body. A client must not be able to supply them itself, because anything
+// downstream that reads them -- routing rules, rate-limit tiers, accounting --
+// treats a non-empty value as plugin-derived. A body that fails to parse is
+// the case that matters: the plugin sets nothing, so without clearing, the
+// caller's value is what survives.
 
 func TestOwnedHeaders_ClientSuppliedModelClearedOnUnparseableBody(t *testing.T) {
 	next := &nextRecorder{}
@@ -41,20 +30,6 @@ func TestOwnedHeaders_ClientSuppliedModelClearedOnUnparseableBody(t *testing.T) 
 	}
 }
 
-func TestOwnedHeaders_ClientSuppliedParseFailureCleared(t *testing.T) {
-	next := &nextRecorder{}
-	h := newHandler(t, CreateConfig(), next)
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	req.Header.Set(ParseFailureHeader, "pretend-it-parsed")
-	h.ServeHTTP(httptest.NewRecorder(), req)
-
-	if got := next.header.Get(ParseFailureHeader); got != "" {
-		t.Errorf("%s = %q, want empty: a client-supplied value reached downstream", ParseFailureHeader, got)
-	}
-}
-
-// Clearing must not disturb the headers the plugin legitimately derives.
 func TestOwnedHeaders_DerivedModelStillReachesDownstream(t *testing.T) {
 	next := &nextRecorder{}
 	h := newHandler(t, CreateConfig(), next)

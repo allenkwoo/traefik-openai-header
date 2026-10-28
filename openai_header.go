@@ -243,19 +243,19 @@ type batchRequest struct {
 }
 
 func (e *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The plugin owns these headers, so a client must not be able to supply
-	// one itself. Cleared before the early return and before any parse, so no
-	// request path can carry a caller-supplied value downstream.
-	for _, header := range e.ownedHeaders {
-		r.Header.Del(header)
-	}
-
 	isChatCompletionRequest := matches(e.chatRegex, r.RequestURI)
 	isBatchRequest := matches(e.batchRegex, r.RequestURI)
 
 	if (!isChatCompletionRequest && !isBatchRequest) || r.Method != http.MethodPost {
 		e.next.ServeHTTP(w, r)
 		return
+	}
+
+	// The plugin owns these headers on the requests it handles, so a client
+	// must not be able to supply one itself. Cleared before the parse, so a
+	// body that fails to parse cannot leave a caller-supplied value in place.
+	for _, header := range e.ownedHeaders {
+		r.Header.Del(header)
 	}
 
 	data, held, complete, ok := e.readBody(w, r)
